@@ -1,0 +1,138 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Agricultural Theme Design System - Earth tones and nature-inspired colors */
+
+@layer base {
+  :root {
+    --background: 43 23% 96%;
+    --foreground: 100 25% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 100 25% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 100 25% 15%;
+
+    --primary: 95 38% 32%;
+    --primary-foreground: 43 23% 96%;
+
+    --secondary: 95 12% 87%;
+    --secondary-foreground: 95 38% 22%;
+
+    --muted: 95 12% 92%;
+    --muted-foreground: 95 8% 45%;
+
+    --accent: 120 40% 45%;
+    --accent-foreground: 43 23% 96%;
+
+    --destructive: 10 78% 54%;
+    --destructive-foreground: 43 23% 96%;
+
+    --warning: 42 96% 58%;
+    --warning-foreground: 100 25% 15%;
+
+    --success: 120 40% 45%;
+    --success-foreground: 43 23% 96%;
+
+    --info: 200 50% 55%;
+    --info-foreground: 43 23% 96%;
+
+    --border: 95 12% 87%;
+    --input: 95 12% 87%;
+    --ring: 95 38% 32%;
+
+    --radius: 0.75rem;
+    
+    /* Agricultural gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(95 38% 32%), hsl(120 40% 45%));
+    --gradient-earth: linear-gradient(180deg, hsl(43 23% 96%), hsl(95 12% 92%));
+    --gradient-sky: linear-gradient(180deg, hsl(200 80% 85%), hsl(200 50% 70%));
+    
+    /* Shadows */
+    --shadow-soft: 0 4px 20px -4px hsl(95 38% 32% / 0.1);
+    --shadow-strong: 0 10px 30px -10px hsl(95 38% 32% / 0.3);
+    
+    /* Transitions */
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+    --sidebar-background: 0 0% 98%;
+
+    --sidebar-foreground: 240 5.3% 26.1%;
+
+    --sidebar-primary: 240 5.9% 10%;
+
+    --sidebar-primary-foreground: 0 0% 98%;
+
+    --sidebar-accent: 240 4.8% 95.9%;
+
+    --sidebar-accent-foreground: 240 5.9% 10%;
+
+    --sidebar-border: 220 13% 91%;
+
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+    --background: 100 25% 8%;
+    --foreground: 43 23% 96%;
+
+    --card: 100 25% 12%;
+    --card-foreground: 43 23% 96%;
+
+    --popover: 100 25% 12%;
+    --popover-foreground: 43 23% 96%;
+
+    --primary: 120 40% 55%;
+    --primary-foreground: 100 25% 8%;
+
+    --secondary: 95 8% 20%;
+    --secondary-foreground: 43 23% 96%;
+
+    --muted: 95 8% 18%;
+    --muted-foreground: 95 8% 65%;
+
+    --accent: 120 40% 45%;
+    --accent-foreground: 100 25% 8%;
+
+    --destructive: 10 78% 54%;
+    --destructive-foreground: 43 23% 96%;
+
+    --warning: 42 96% 58%;
+    --warning-foreground: 100 25% 8%;
+
+    --success: 120 40% 55%;
+    --success-foreground: 100 25% 8%;
+
+    --info: 200 50% 65%;
+    --info-foreground: 100 25% 8%;
+
+    --border: 95 8% 20%;
+    --input: 95 8% 20%;
+    --ring: 120 40% 55%;
+    
+    /* Dark mode gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(95 38% 25%), hsl(120 40% 35%));
+    --gradient-earth: linear-gradient(180deg, hsl(100 25% 12%), hsl(95 8% 18%));
+    --gradient-sky: linear-gradient(180deg, hsl(200 30% 25%), hsl(200 20% 20%));
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
