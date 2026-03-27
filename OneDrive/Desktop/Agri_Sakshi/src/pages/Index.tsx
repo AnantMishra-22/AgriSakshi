@@ -11,19 +11,22 @@ import { LocationData } from '@/services/locationService';
 import DiseaseDetectionTab from '@/components/tabs/DiseaseDetectionTab';
 import { CurrentWeather, WeatherForecast } from '@/services/weatherService';
 import { SoilData } from '@/services/soilService';
+import { ChemicalTestData, ChemicalTestResult, chemicalResultsToData } from '@/services/recommendationService';
 
 const Index = () => {
-  const [activeTab, setActiveTab] = useState('home');
-  const [location, setLocation] = useState<LocationData | null>(null);
-  const [weather, setWeather] = useState<CurrentWeather | null>(null);
-  const [soilData, setSoilData] = useState<SoilData | null>(null);
-  const [forecast, setForecast] = useState<WeatherForecast[]>([]);
+  const [activeTab, setActiveTab]       = useState('home');
+  const [location, setLocation]         = useState<LocationData | null>(null);
+  const [weather, setWeather]           = useState<CurrentWeather | null>(null);
+  const [soilData, setSoilData]         = useState<SoilData | null>(null);
+  const [forecast, setForecast]         = useState<WeatherForecast[]>([]);
+  // Chemical test results flow from SoilTab → CropTab
+  const [chemical, setChemical]         = useState<ChemicalTestData | null>(null);
 
   const renderActiveTab = () => {
     switch (activeTab) {
       case 'home':
         return (
-          <HomeTab 
+          <HomeTab
             onLocationUpdate={setLocation}
             onWeatherUpdate={setWeather}
             onSoilUpdate={setSoilData}
@@ -33,14 +36,21 @@ const Index = () => {
       case 'climate':
         return <ClimateTab location={location} />;
       case 'soil':
-        return <SoilTab location={location} initialSoilData={soilData} />;
+        return (
+          <SoilTab
+            location={location}
+            initialSoilData={soilData}
+            onChemicalResults={(results: ChemicalTestResult[]) => setChemical(chemicalResultsToData(results))}
+          />
+        );
       case 'crop':
         return (
-          <CropTab 
+          <CropTab
             location={location}
             soilData={soilData}
             currentWeather={weather}
             forecast={forecast}
+            chemical={chemical}
           />
         );
       case 'disease-detection':
@@ -52,15 +62,20 @@ const Index = () => {
       case 'settings':
         return <SettingsTab />;
       default:
-        return <HomeTab onLocationUpdate={setLocation} onWeatherUpdate={setWeather} onSoilUpdate={setSoilData} onTabChange={setActiveTab} />;
+        return (
+          <HomeTab
+            onLocationUpdate={setLocation}
+            onWeatherUpdate={setWeather}
+            onSoilUpdate={setSoilData}
+            onTabChange={setActiveTab}
+          />
+        );
     }
   };
 
   return (
     <div className="min-h-screen bg-background">
-      <main className="relative">
-        {renderActiveTab()}
-      </main>
+      <main className="relative">{renderActiveTab()}</main>
       <TabNavigation activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );
