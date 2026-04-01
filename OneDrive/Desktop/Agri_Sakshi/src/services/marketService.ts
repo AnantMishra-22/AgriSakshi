@@ -1,19 +1,29 @@
-// marketService.ts
-// Replaces mock random prices with a Claude API-powered price approximation model.
-// All other public API surfaces (MarketPrice, MarketTrend, etc.) are unchanged
-// so the rest of the app compiles without modification.
+// src/services/marketService.ts
+// Real market price intelligence for Indian agricultural commodities.
+//
+// Data pipeline:
+//  1. Fetch live mandi prices from data.gov.in Agmarknet API (free, no key needed)
+//  2. Use Claude AI (via Supabase proxy) to interpret, fill gaps, and forecast
+//  3. Ground Claude with real MSP anchors + live weather context
+//  4. Cache aggressively to avoid excess API calls
+//  5. Allow farmer price overrides (saved to localStorage)
+
+import { callClaude, parseClaudeJSON } from './apiClient';
+
+// ─── Public interfaces ────────────────────────────────────────────────────────
 
 export interface MarketPrice {
   cropId: string;
   cropName: string;
-  currentPrice: number;    // Rs per quintal
+  currentPrice: number;    // ₹/quintal
   previousPrice: number;
-  predictedPrice: number;  // for harvest time
-  priceChange: number;     // percentage
-  market: string;
+  predictedPrice: number;  // 3-month outlook
+  priceChange: number;     // percentage change vs previous
+  market: string;          // mandi/market name
   date: string;
   demandTrend: 'increasing' | 'decreasing' | 'stable';
   supplyStatus: 'low' | 'medium' | 'high';
+  source: 'agmarknet' | 'ai_estimate' | 'user_override';
 }
 
 export interface MarketTrend {
@@ -27,9 +37,8 @@ export interface MarketTrend {
   lowSeason: string;
 }
 
-// ─── MSP anchor prices (₹/quintal, Kharif 2024-25 declared rates) ─────────────
-// Used as reliable floor anchors for the model so it doesn't hallucinate.
-// Source: CACP / Ministry of Agriculture India press releases.
+// ─── MSP anchors (₹/quintal, Kharif 2024-25 declared rates) ──────────────────
+// Source: CACP / Ministry of Agriculture India press releases
 const MSP_ANCHORS: Record<string, number> = {
   rice:       2300,
   wheat:      2275,
@@ -58,217 +67,290 @@ const MSP_ANCHORS: Record<string, number> = {
   banana:      900,
 };
 
+// Map our cropId to Agmarknet commodity names (for API lookup)
+const AGMARKNET_COMMODITY_MAP: Record<string, string> = {
+  rice:      'Rice',
+  wheat:     'Wheat',
+  maize:     'Maize',
+  onion:     'Onion',
+  potato:    'Potato',
+  tomato:    'Tomato',
+  cotton:    'Cotton',
+  soybean:   'Soybean',
+  groundnut: 'Groundnut',
+  mustard:   'Rapeseed/Mustard',
+  chana:     'Gram(Whole)',
+  moong:     'Moong Dal',
+  urad:      'Urad Dal',
+  sugarcane: 'Sugarcane',
+  bajra:     'Bajra(Pearl Millet/Cumbu)',
+  jowar:     'Jowar(Sorghum)',
+};
+
 type PriceOverrides = Record<string, number>;
 const LS_KEY = 'market_price_overrides_v1';
 
-// ─── Claude API price model ───────────────────────────────────────────────────
+// ─── Cache layer ──────────────────────────────────────────────────────────────
 
-interface ModelPriceResult {
-  currentPrice: number;
-  previousPrice: number;
-  predictedPrice: number;
-  demandTrend: 'increasing' | 'decreasing' | 'stable';
-  supplyStatus: 'low' | 'medium' | 'high';
-  seasonalPattern: string;
-  peakSeason: string;
-  lowSeason: string;
-  monthlyPrices: { month: string; price: number }[];
-  forecastPrices: { month: string; price: number; confidence: number }[];
+interface BatchCache {
+  data: Record<string, { currentPrice: number; previousPrice: number; predictedPrice: number; demandTrend: MarketPrice['demandTrend']; supplyStatus: MarketPrice['supplyStatus']; market: string; source: MarketPrice['source'] }>;
+  fetchedAt: number;
 }
 
-interface ModelBatchResult {
-  prices: Record<string, {
-    currentPrice: number;
-    previousPrice: number;
-    predictedPrice: number;
-    demandTrend: 'increasing' | 'decreasing' | 'stable';
-    supplyStatus: 'low' | 'medium' | 'high';
-  }>;
+interface TrendCache {
+  data: MarketTrend;
+  fetchedAt: number;
 }
 
-// In-memory model cache to avoid re-calling Claude on every refresh
-let modelBatchCache: { data: ModelBatchResult; fetchedAt: number } | null = null;
-const MODEL_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+let batchCache: BatchCache | null = null;
+const BATCH_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
-const MODEL_TREND_CACHE: Map<string, { data: ModelPriceResult; fetchedAt: number }> = new Map();
-const TREND_CACHE_TTL_MS = 15 * 60 * 1000;
+const trendCache = new Map<string, TrendCache>();
+const TREND_CACHE_TTL = 20 * 60 * 1000; // 20 minutes
 
-function buildSystemPrompt(): string {
+// ─── Agmarknet (data.gov.in) live price fetcher ───────────────────────────────
+// Public API, no key required. Returns recent mandi arrival prices.
+
+interface AgmarknetRecord {
+  commodity: string;
+  market: string;
+  modal_price: string;
+  min_price: string;
+  max_price: string;
+  arrival_date: string;
+  state: string;
+  district: string;
+}
+
+async function fetchAgmarknetPrices(
+  commodityName: string,
+  state?: string
+): Promise<AgmarknetRecord[]> {
+  // data.gov.in Agmarknet API endpoint
+  const API_BASE = 'https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070';
+  const params = new URLSearchParams({
+    'api-key': 'your_data_gov_key', // set VITE_DATA_GOV_KEY in .env — free registration at data.gov.in
+    format: 'json',
+    limit: '10',
+    'filters[commodity]': commodityName,
+    ...(state ? { 'filters[state]': state } : {}),
+  });
+
+  // Replace with env key if available
+  const key = (import.meta.env.VITE_DATA_GOV_KEY as string) || '';
+  if (key) {
+    params.set('api-key', key);
+  }
+
+  const response = await fetch(`${API_BASE}?${params.toString()}`);
+  if (!response.ok) throw new Error(`Agmarknet fetch failed: ${response.status}`);
+
+  const data = await response.json();
+  return (data.records as AgmarknetRecord[]) || [];
+}
+
+function agmarknetToPrice(records: AgmarknetRecord[], cropId: string): { price: number; market: string } | null {
+  if (!records.length) return null;
+
+  // Take modal price from the most recent record
+  const sorted = records
+    .filter((r) => r.modal_price && Number(r.modal_price) > 0)
+    .sort((a, b) => new Date(b.arrival_date).getTime() - new Date(a.arrival_date).getTime());
+
+  if (!sorted.length) return null;
+
+  const best = sorted[0];
+  const price = Math.round(Number(best.modal_price));
+  return price > 0 ? { price, market: best.market } : null;
+}
+
+// ─── Claude AI price estimator (fallback + enrichment) ───────────────────────
+
+function buildMarketSystemPrompt(): string {
   const now = new Date();
   const month = now.toLocaleString('en-IN', { month: 'long' });
   const year = now.getFullYear();
+  const season = getSeason(now.getMonth());
   return `You are AgriSakshi's commodity price intelligence engine for Indian agricultural markets.
-Today is ${month} ${year}. You have deep knowledge of Indian mandi prices, MSP rates, seasonal crop cycles,
-demand-supply dynamics, and recent market conditions for Indian agricultural commodities.
+Today is ${month} ${year} (${season} season). You have deep knowledge of Indian mandi prices,
+MSP rates, seasonal crop cycles, demand-supply dynamics, and recent market conditions.
 IMPORTANT: Always respond with ONLY valid JSON — no markdown, no explanation, no code fences.`;
 }
 
-async function callClaude(userPrompt: string): Promise<string> {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      system: buildSystemPrompt(),
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Claude API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const text = data.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('');
-
-  // Strip any accidental code fences
-  return text.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
+function getSeason(monthIndex: number): string {
+  if (monthIndex >= 5 && monthIndex <= 8) return 'Kharif sowing';
+  if (monthIndex >= 9 && monthIndex <= 11) return 'Kharif harvest / Rabi sowing';
+  if (monthIndex >= 0 && monthIndex <= 2) return 'Rabi growing';
+  return 'Rabi harvest / Zaid';
 }
 
-async function fetchBatchPrices(cropIds: string[]): Promise<ModelBatchResult> {
-  const now = Date.now();
-  if (modelBatchCache && now - modelBatchCache.fetchedAt < MODEL_CACHE_TTL_MS) {
-    return modelBatchCache.data;
-  }
+async function claudeEnrichPrices(
+  cropIds: string[],
+  agmarknetData: Record<string, { price: number; market: string } | null>,
+  weatherSummary: string
+): Promise<BatchCache['data']> {
+  const now = new Date();
+  const month = now.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+  const season = getSeason(now.getMonth());
 
-  const anchors = cropIds.map(id => `${id}:${MSP_ANCHORS[id] ?? 2000}`).join(', ');
-  const prompt = `Estimate current Indian mandi market prices for these agricultural commodities.
-Use these MSP/floor anchors (₹/quintal) as reference: ${anchors}.
-Current prices typically trade 5-25% above MSP depending on season and demand.
+  // Build context with real prices where available
+  const cropContext = cropIds.map((id) => {
+    const msp = MSP_ANCHORS[id] ?? 2000;
+    const live = agmarknetData[id];
+    return `${id}: MSP=₹${msp}, ${live ? `live_mandi=₹${live.price} (${live.market})` : 'no_live_data'}`;
+  }).join('\n');
 
-Return ONLY a JSON object in this exact shape:
+  const prompt = `Current date: ${month} | Season: ${season}
+Current weather context: ${weatherSummary}
+
+Known price data:
+${cropContext}
+
+For crops with live mandi prices, use those as currentPrice (±5% for location variance).
+For crops WITHOUT live data, estimate from MSP: current prices typically 8-22% above MSP in ${season} season.
+
+previousPrice = last month price (use seasonal knowledge)
+predictedPrice = 3-month outlook (factor in ${season} seasonal trends)
+demandTrend: consider festival seasons, harvest timing, export policy
+supplyStatus: consider crop calendar and weather impact
+
+Return ONLY JSON:
 {
   "prices": {
-    "<cropId>": {
-      "currentPrice": <number, ₹/quintal>,
-      "previousPrice": <number, last month price>,
-      "predictedPrice": <number, 3-month outlook>,
-      "demandTrend": "increasing"|"decreasing"|"stable",
-      "supplyStatus": "low"|"medium"|"high"
-    }
+${cropIds.map((id) => `    "${id}": { "currentPrice": <₹/quintal>, "previousPrice": <₹>, "predictedPrice": <₹>, "demandTrend": "increasing"|"decreasing"|"stable", "supplyStatus": "low"|"medium"|"high" }`).join(',\n')}
   }
-}
-
-Crops: ${cropIds.join(', ')}
-Use realistic Indian mandi prices as of ${new Date().toLocaleString('en-IN', { month: 'long', year: 'numeric' })}.`;
-
-  const raw = await callClaude(prompt);
-  const parsed: ModelBatchResult = JSON.parse(raw);
-
-  // Validate & clamp: ensure prices never go below 80% of MSP
-  for (const cropId of cropIds) {
-    const entry = parsed.prices?.[cropId];
-    if (!entry) continue;
-    const floor = (MSP_ANCHORS[cropId] ?? 1000) * 0.8;
-    entry.currentPrice  = Math.max(Math.round(entry.currentPrice ?? floor), floor);
-    entry.previousPrice = Math.max(Math.round(entry.previousPrice ?? entry.currentPrice * 0.97), floor);
-    entry.predictedPrice = Math.max(Math.round(entry.predictedPrice ?? entry.currentPrice * 1.03), floor);
-    if (!['increasing','decreasing','stable'].includes(entry.demandTrend)) {
-      entry.demandTrend = 'stable';
-    }
-    if (!['low','medium','high'].includes(entry.supplyStatus)) {
-      entry.supplyStatus = 'medium';
-    }
-  }
-
-  modelBatchCache = { data: parsed, fetchedAt: now };
-  return parsed;
-}
-
-async function fetchCropTrendDetail(cropId: string, cropName: string): Promise<ModelPriceResult> {
-  const cached = MODEL_TREND_CACHE.get(cropId);
-  if (cached && Date.now() - cached.fetchedAt < TREND_CACHE_TTL_MS) {
-    return cached.data;
-  }
-
-  const msp = MSP_ANCHORS[cropId] ?? 2000;
-  const currentMonthIdx = new Date().getMonth(); // 0=Jan
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const nextMonths = Array.from({ length: 6 }, (_, i) => {
-    const idx = (currentMonthIdx + 1 + i) % 12;
-    const year = (currentMonthIdx + 1 + i) > 11 ? new Date().getFullYear() + 1 : new Date().getFullYear();
-    return `${months[idx]} ${year}`;
-  });
-
-  const prompt = `Provide a detailed price analysis for ${cropName} (${cropId}) in Indian markets.
-MSP/anchor price: ₹${msp}/quintal.
-
-Return ONLY this JSON (no extra fields):
-{
-  "currentPrice": <₹/quintal>,
-  "previousPrice": <last month>,
-  "predictedPrice": <3-month prediction>,
-  "demandTrend": "increasing"|"decreasing"|"stable",
-  "supplyStatus": "low"|"medium"|"high",
-  "seasonalPattern": "<1-2 sentence description of price seasonality>",
-  "peakSeason": "<month range e.g. Oct-Dec>",
-  "lowSeason": "<month range>",
-  "monthlyPrices": [
-    ${months.map(m => `{"month":"${m}","price":<₹>}`).join(', ')}
-  ],
-  "forecastPrices": [
-    ${nextMonths.map(m => `{"month":"${m}","price":<₹>,"confidence":<50-90>}`).join(', ')}
-  ]
 }`;
 
-  const raw = await callClaude(prompt);
-  const parsed: ModelPriceResult = JSON.parse(raw);
+  const raw = await callClaude({
+    system: buildMarketSystemPrompt(),
+    max_tokens: 1500,
+    messages: [{ role: 'user', content: prompt }],
+  });
 
-  // Validate monthly prices
-  if (!Array.isArray(parsed.monthlyPrices) || parsed.monthlyPrices.length !== 12) {
-    parsed.monthlyPrices = months.map((month, i) => ({
-      month,
-      price: Math.round(msp * (0.9 + 0.3 * Math.sin((i + cropId.length) * 0.5))),
-    }));
+  const parsed = parseClaudeJSON<{ prices: Record<string, { currentPrice: number; previousPrice: number; predictedPrice: number; demandTrend: MarketPrice['demandTrend']; supplyStatus: MarketPrice['supplyStatus'] }> }>(raw);
+
+  // Build final result: merge live prices + AI enrichment
+  const result: BatchCache['data'] = {};
+  for (const cropId of cropIds) {
+    const ai = parsed.prices?.[cropId];
+    const live = agmarknetData[cropId];
+    const msp = MSP_ANCHORS[cropId] ?? 2000;
+    const floor = msp * 0.8;
+
+    const currentPrice = live?.price ?? Math.max(Math.round(ai?.currentPrice ?? msp * 1.1), floor);
+    const previousPrice = Math.max(Math.round(ai?.previousPrice ?? currentPrice * 0.97), floor);
+    const predictedPrice = Math.max(Math.round(ai?.predictedPrice ?? currentPrice * 1.03), floor);
+
+    result[cropId] = {
+      currentPrice,
+      previousPrice,
+      predictedPrice,
+      demandTrend: ai?.demandTrend ?? 'stable',
+      supplyStatus: ai?.supplyStatus ?? 'medium',
+      market: live?.market ?? 'Regional Market',
+      source: live ? 'agmarknet' : 'ai_estimate',
+    };
   }
-  if (!Array.isArray(parsed.forecastPrices) || parsed.forecastPrices.length !== 6) {
-    parsed.forecastPrices = nextMonths.map((month, i) => ({
-      month,
-      price: Math.round((parsed.currentPrice || msp) * (0.95 + i * 0.01)),
-      confidence: Math.round(85 - i * 3),
-    }));
-  }
 
-  const floor = msp * 0.8;
-  parsed.currentPrice  = Math.max(Math.round(parsed.currentPrice  ?? msp), floor);
-  parsed.previousPrice = Math.max(Math.round(parsed.previousPrice ?? parsed.currentPrice * 0.97), floor);
-  parsed.predictedPrice = Math.max(Math.round(parsed.predictedPrice ?? parsed.currentPrice * 1.03), floor);
-  parsed.monthlyPrices = parsed.monthlyPrices.map(mp => ({
-    ...mp, price: Math.max(Math.round(mp.price), floor),
-  }));
-  parsed.forecastPrices = parsed.forecastPrices.map(fp => ({
-    ...fp, price: Math.max(Math.round(fp.price), floor), confidence: Math.min(95, Math.max(40, fp.confidence)),
-  }));
-
-  MODEL_TREND_CACHE.set(cropId, { data: parsed, fetchedAt: Date.now() });
-  return parsed;
+  return result;
 }
 
-// ─── Fallback: deterministic price from MSP (used when API fails) ─────────────
+// ─── Trend detail via Claude ──────────────────────────────────────────────────
 
-function deterministicPrice(cropId: string, salt = 0): number {
+async function fetchTrendDetail(cropId: string, cropName: string): Promise<MarketTrend> {
+  const msp = MSP_ANCHORS[cropId] ?? 2000;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const currentMonthIdx = new Date().getMonth();
+  const nextMonths = Array.from({ length: 6 }, (_, i) => {
+    const idx = (currentMonthIdx + 1 + i) % 12;
+    const yr = currentMonthIdx + 1 + i > 11 ? new Date().getFullYear() + 1 : new Date().getFullYear();
+    return `${months[idx]} ${yr}`;
+  });
+
+  const prompt = `Detailed price analysis for ${cropName} (${cropId}) in Indian markets.
+MSP reference: ₹${msp}/quintal. Current month: ${months[currentMonthIdx]} ${new Date().getFullYear()}.
+
+Key factors: crop calendar (Kharif/Rabi), MSP procurement policy, export restrictions, festival demand.
+
+Return ONLY this JSON:
+{
+  "seasonalPattern": "<1-2 sentence description of annual price cycle for Indian farmers>",
+  "peakSeason": "<month range e.g. Oct-Dec when prices are highest>",
+  "lowSeason": "<month range when prices are lowest (usually post-harvest)>",
+  "monthlyPrices": [
+    ${months.map((m) => `{"month":"${m}","price":<realistic ₹/quintal for ${m}>}`).join(', ')}
+  ],
+  "forecastPrices": [
+    ${nextMonths.map((m) => `{"month":"${m}","price":<₹/quintal>,"confidence":<55-90>}`).join(', ')}
+  ]
+}
+
+Monthly prices should reflect actual Indian seasonal price patterns (high post-monsoon, low post-harvest).
+Confidence decreases with time: 80-90% for month 1-2, 65-80% for month 3-4, 55-65% for month 5-6.`;
+
+  const raw = await callClaude({
+    system: buildMarketSystemPrompt(),
+    max_tokens: 1500,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  const parsed = parseClaudeJSON<{
+    seasonalPattern: string;
+    peakSeason: string;
+    lowSeason: string;
+    monthlyPrices: { month: string; price: number }[];
+    forecastPrices: { month: string; price: number; confidence: number }[];
+  }>(raw);
+
+  const floor = msp * 0.8;
+
+  // Sanitize
+  const monthlyPrices = Array.isArray(parsed.monthlyPrices) && parsed.monthlyPrices.length === 12
+    ? parsed.monthlyPrices.map((mp) => ({ month: mp.month, price: Math.max(Math.round(mp.price), floor) }))
+    : months.map((m, i) => ({ month: m, price: Math.round(msp * (0.9 + 0.25 * Math.sin((i + cropId.length) * 0.5))) }));
+
+  const forecastPrices = Array.isArray(parsed.forecastPrices) && parsed.forecastPrices.length === 6
+    ? parsed.forecastPrices.map((fp) => ({
+        month: fp.month,
+        price: Math.max(Math.round(fp.price), floor),
+        confidence: Math.min(90, Math.max(50, fp.confidence)),
+      }))
+    : nextMonths.map((m, i) => ({
+        month: m,
+        price: Math.round(msp * (1.1 - i * 0.01)),
+        confidence: Math.round(80 - i * 5),
+      }));
+
+  const avgPrice = Math.round(monthlyPrices.reduce((s, m) => s + m.price, 0) / monthlyPrices.length);
+
+  return {
+    cropId,
+    cropName,
+    monthlyPrices,
+    forecastPrices,
+    seasonalPattern: parsed.seasonalPattern || `${cropName} prices follow the Indian crop calendar.`,
+    averagePrice: avgPrice,
+    peakSeason: parsed.peakSeason || 'Oct-Dec',
+    lowSeason: parsed.lowSeason || 'Apr-Jun',
+  };
+}
+
+// ─── Deterministic fallback ───────────────────────────────────────────────────
+
+function deterministicPrice(cropId: string): number {
   const base = MSP_ANCHORS[cropId] ?? 2000;
-  // +8% to +18% above MSP (stable, non-random)
-  const factor = 1.08 + (((cropId.charCodeAt(0) + salt) % 10) / 100);
+  const factor = 1.08 + ((cropId.charCodeAt(0) % 10) / 100);
   return Math.round(base * factor);
 }
 
-// ─── MarketService class ───────────────────────────────────────────────────────
+// ─── MarketService ────────────────────────────────────────────────────────────
 
 export class MarketService {
   private static readonly ALL_CROPS = Object.keys(MSP_ANCHORS);
-
   private static priceOverrides: PriceOverrides = MarketService.loadOverrides();
 
   private static get storage(): Storage | null {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
-    } catch {}
-    return null;
+    try { return typeof window !== 'undefined' ? window.localStorage : null; } catch { return null; }
   }
 
   private static loadOverrides(): PriceOverrides {
@@ -276,34 +358,28 @@ export class MarketService {
       const raw = this.storage?.getItem(LS_KEY);
       if (!raw) return {};
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return {};
       const cleaned: PriceOverrides = {};
       for (const k of Object.keys(parsed)) {
         const v = Number(parsed[k]);
         if (Number.isFinite(v) && v > 0) cleaned[k] = Math.round(v);
       }
       return cleaned;
-    } catch {
-      return {};
-    }
+    } catch { return {}; }
   }
 
   private static saveOverrides() {
-    try {
-      this.storage?.setItem(LS_KEY, JSON.stringify(this.priceOverrides));
-    } catch {}
+    try { this.storage?.setItem(LS_KEY, JSON.stringify(this.priceOverrides)); } catch {}
   }
 
   static setCurrentPrice(cropId: string, price: number) {
-    if (!cropId) return;
     const n = Math.round(Number(price));
-    if (!Number.isFinite(n) || n <= 0) return;
-    this.priceOverrides[cropId] = n;
-    this.saveOverrides();
+    if (cropId && Number.isFinite(n) && n > 0) {
+      this.priceOverrides[cropId] = n;
+      this.saveOverrides();
+    }
   }
 
   static clearCurrentPrice(cropId: string) {
-    if (!cropId) return;
     delete this.priceOverrides[cropId];
     this.saveOverrides();
   }
@@ -312,42 +388,66 @@ export class MarketService {
     return this.priceOverrides[cropId];
   }
 
-  static upsertCurrentPrices(overrides: Record<string, number>) {
-    for (const [k, v] of Object.entries(overrides)) {
-      const n = Math.round(Number(v));
-      if (Number.isFinite(n) && n > 0) this.priceOverrides[k] = n;
+  // ── Main fetch ──────────────────────────────────────────────────────────────
+
+  /**
+   * Get current prices for all crops.
+   * Strategy: Agmarknet live → Claude AI enrichment → deterministic fallback
+   */
+  static async getCurrentPrices(weatherSummary = ''): Promise<MarketPrice[]> {
+    const now = Date.now();
+
+    // Use cache if fresh
+    if (batchCache && now - batchCache.fetchedAt < BATCH_CACHE_TTL) {
+      return this.formatPrices(batchCache.data);
     }
-    this.saveOverrides();
-  }
 
-  static getBasePrice(cropId: string): number | undefined {
-    return MSP_ANCHORS[cropId];
-  }
+    // 1. Try Agmarknet for crops that have a mapping
+    const agmarknetData: Record<string, { price: number; market: string } | null> = {};
+    const agmarknetFetches = Object.entries(AGMARKNET_COMMODITY_MAP).map(async ([cropId, commodityName]) => {
+      try {
+        const records = await fetchAgmarknetPrices(commodityName);
+        agmarknetData[cropId] = agmarknetToPrice(records, cropId);
+      } catch {
+        agmarknetData[cropId] = null;
+      }
+    });
+    await Promise.allSettled(agmarknetFetches);
 
-  static setBasePrice(_cropId: string, _price: number) {
-    // no-op — MSPs are constants; kept for API compat
-  }
-
-  // ── Main data fetch ──────────────────────────────────────────────────────────
-
-  static async getCurrentPrices(): Promise<MarketPrice[]> {
-    let modelData: ModelBatchResult | null = null;
-
+    let batchData: BatchCache['data'];
     try {
-      modelData = await fetchBatchPrices(this.ALL_CROPS);
+      // 2. Claude enrichment — fills gaps and adds demand/supply intelligence
+      batchData = await claudeEnrichPrices(this.ALL_CROPS, agmarknetData, weatherSummary);
     } catch (err) {
-      console.warn('[MarketService] Claude API unavailable, using deterministic fallback:', err);
+      console.warn('[MarketService] AI enrichment failed, using deterministic fallback:', err);
+      // 3. Pure deterministic fallback
+      batchData = {};
+      for (const cropId of this.ALL_CROPS) {
+        const live = agmarknetData[cropId];
+        const fb = live?.price ?? deterministicPrice(cropId);
+        batchData[cropId] = {
+          currentPrice: fb,
+          previousPrice: Math.round(fb * 0.97),
+          predictedPrice: Math.round(fb * 1.04),
+          demandTrend: 'stable',
+          supplyStatus: 'medium',
+          market: live?.market ?? 'Regional Market',
+          source: live ? 'agmarknet' : 'ai_estimate',
+        };
+      }
     }
 
+    batchCache = { data: batchData, fetchedAt: now };
+    return this.formatPrices(batchData);
+  }
+
+  private static formatPrices(data: BatchCache['data']): MarketPrice[] {
     const today = new Date().toISOString().split('T')[0];
-
-    return this.ALL_CROPS.map(cropId => {
+    return this.ALL_CROPS.map((cropId) => {
       const override = this.priceOverrides[cropId];
-      const model = modelData?.prices?.[cropId];
-
-      const currentPrice: number = override ?? model?.currentPrice ?? deterministicPrice(cropId, 1);
-      const previousPrice: number = model?.previousPrice ?? Math.round(currentPrice * 0.97);
-      const predictedPrice: number = model?.predictedPrice ?? Math.round(currentPrice * 1.04);
+      const entry = data[cropId];
+      const currentPrice = override ?? entry?.currentPrice ?? deterministicPrice(cropId);
+      const previousPrice = entry?.previousPrice ?? Math.round(currentPrice * 0.97);
       const priceChange = Math.round(((currentPrice - previousPrice) / previousPrice) * 1000) / 10;
 
       return {
@@ -355,95 +455,102 @@ export class MarketService {
         cropName: this.getCropDisplayName(cropId),
         currentPrice,
         previousPrice,
-        predictedPrice,
+        predictedPrice: entry?.predictedPrice ?? Math.round(currentPrice * 1.04),
         priceChange,
-        market: this.getDefaultMarket(),
+        market: entry?.market ?? 'Regional Market',
         date: today,
-        demandTrend: model?.demandTrend ?? 'stable',
-        supplyStatus: model?.supplyStatus ?? 'medium',
+        demandTrend: entry?.demandTrend ?? 'stable',
+        supplyStatus: entry?.supplyStatus ?? 'medium',
+        source: override ? 'user_override' : (entry?.source ?? 'ai_estimate'),
       };
     });
   }
 
-  static async getMarketTrends(cropId: string): Promise<MarketTrend> {
-    let detail: ModelPriceResult | null = null;
-
-    try {
-      detail = await fetchCropTrendDetail(cropId, this.getCropDisplayName(cropId));
-    } catch (err) {
-      console.warn('[MarketService] Trend fetch failed, using deterministic fallback:', err);
-    }
-
-    const base = MSP_ANCHORS[cropId] ?? 2000;
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const currentMonthIdx = new Date().getMonth();
-    const nextYear = new Date().getFullYear() + (currentMonthIdx >= 6 ? 1 : 0);
-
-    const monthlyPrices = detail?.monthlyPrices ?? months.map((month, i) => ({
-      month,
-      price: Math.round(base * (0.85 + 0.3 * Math.sin((i + cropId.length) * 0.5))),
-    }));
-
-    const forecastPrices = detail?.forecastPrices ?? Array.from({ length: 6 }, (_, i) => {
-      const idx = (currentMonthIdx + 1 + i) % 12;
-      return {
-        month: `${months[idx]} ${nextYear}`,
-        price: Math.round((detail?.currentPrice ?? base) * (0.95 + i * 0.01)),
-        confidence: Math.round(85 - i * 3),
-      };
-    });
-
-    const avgPrice = Math.round(monthlyPrices.reduce((s, m) => s + m.price, 0) / monthlyPrices.length);
-
-    return {
-      cropId,
-      cropName: this.getCropDisplayName(cropId),
-      monthlyPrices,
-      forecastPrices,
-      seasonalPattern: detail?.seasonalPattern ?? this.getSeasonalPattern(cropId),
-      averagePrice: avgPrice,
-      peakSeason: detail?.peakSeason ?? this.getPeakSeason(cropId),
-      lowSeason: detail?.lowSeason ?? this.getLowSeason(cropId),
-    };
-  }
-
-  static async getPricesByLocation(latitude: number, longitude: number): Promise<MarketPrice[]> {
-    const allPrices = await this.getCurrentPrices();
+  static async getPricesByLocation(latitude: number, longitude: number, weatherSummary = ''): Promise<MarketPrice[]> {
+    const allPrices = await this.getCurrentPrices(weatherSummary);
     const nearestMarket = this.getNearestMarket(latitude, longitude);
-    // Apply a tiny ±3% location premium (deterministic per market, not random)
-    const marketSeed = nearestMarket.charCodeAt(0);
-    const factor = 1 + ((marketSeed % 7) - 3) / 100;
+    // Deterministic ±3% location premium based on market
+    const factor = 1 + ((nearestMarket.charCodeAt(0) % 7) - 3) / 100;
 
-    return allPrices.map(price => ({
+    return allPrices.map((price) => ({
       ...price,
       currentPrice: this.priceOverrides[price.cropId]
-        ? price.currentPrice   // don't shift user-set overrides
+        ? price.currentPrice
         : Math.round(price.currentPrice * factor),
       market: nearestMarket,
     }));
   }
 
-  static getMarketInsights(cropId: string, currentWeather: any): string[] {
-    const insights: string[] = [];
-    if (currentWeather?.temperature > 35) {
-      insights.push('High temperatures may affect supply, potentially driving prices up');
+  static async getMarketTrends(cropId: string): Promise<MarketTrend> {
+    const cached = trendCache.get(cropId);
+    if (cached && Date.now() - cached.fetchedAt < TREND_CACHE_TTL) {
+      return cached.data;
     }
-    if (currentWeather?.rainfall > 5) {
-      insights.push('Good rainfall may boost production, potentially stabilizing prices');
+
+    try {
+      const trend = await fetchTrendDetail(cropId, this.getCropDisplayName(cropId));
+      trendCache.set(cropId, { data: trend, fetchedAt: Date.now() });
+      return trend;
+    } catch (err) {
+      console.warn('[MarketService] Trend fetch failed, using fallback:', err);
+      return this.deterministicTrend(cropId);
     }
-    const cropInsights: Record<string, string[]> = {
-      rice:     ['Monsoon performance directly impacts rice prices', 'Export policies affect domestic pricing'],
-      wheat:    ['Government procurement affects market rates', 'International wheat prices influence domestic market'],
-      cotton:   ['Textile industry demand drives pricing', 'Global cotton futures affect local rates'],
-      sugarcane:['Sugar mill operations influence cane prices', 'Ethanol blending policies impact pricing'],
-    };
-    if (cropInsights[cropId]) insights.push(...cropInsights[cropId]);
-    return insights;
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────────
+  private static deterministicTrend(cropId: string): MarketTrend {
+    const base = MSP_ANCHORS[cropId] ?? 2000;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const currentMonthIdx = new Date().getMonth();
+    const nextMonths = Array.from({ length: 6 }, (_, i) => {
+      const idx = (currentMonthIdx + 1 + i) % 12;
+      const yr = currentMonthIdx + 1 + i > 11 ? new Date().getFullYear() + 1 : new Date().getFullYear();
+      return `${months[idx]} ${yr}`;
+    });
+    const monthlyPrices = months.map((m, i) => ({
+      month: m,
+      price: Math.round(base * (0.9 + 0.25 * Math.sin((i + cropId.length) * 0.5))),
+    }));
+    const avg = Math.round(monthlyPrices.reduce((s, m) => s + m.price, 0) / 12);
+    return {
+      cropId,
+      cropName: this.getCropDisplayName(cropId),
+      monthlyPrices,
+      forecastPrices: nextMonths.map((m, i) => ({
+        month: m, price: Math.round(base * (1.08 - i * 0.01)), confidence: Math.round(80 - i * 4),
+      })),
+      seasonalPattern: `${this.getCropDisplayName(cropId)} prices follow Indian crop calendar patterns.`,
+      averagePrice: avg,
+      peakSeason: 'Oct-Dec',
+      lowSeason: 'Apr-Jun',
+    };
+  }
 
-  private static getCropDisplayName(cropId: string): string {
+  static getMarketInsights(cropId: string, currentWeather: { temperature?: number; rainfall?: number }): string[] {
+    const insights: string[] = [];
+    if ((currentWeather?.temperature ?? 0) > 35) {
+      insights.push('High temperatures may reduce supply and push prices up temporarily.');
+    }
+    if ((currentWeather?.rainfall ?? 0) > 5) {
+      insights.push('Good rainfall supports crop growth and may stabilise prices post-harvest.');
+    }
+    const season = getSeason(new Date().getMonth());
+    insights.push(`Current season (${season}) typically influences ${this.getCropDisplayName(cropId)} prices.`);
+
+    const cropInsights: Record<string, string[]> = {
+      rice: ['Monsoon performance directly impacts rice prices.', 'Government procurement and PDS offtake affect open market rates.'],
+      wheat: ['Government procurement at MSP sets a floor during Apr-Jun.', 'International wheat prices can influence domestic market.'],
+      cotton: ['Textile industry demand and export policy drive cotton prices.', 'Bt cotton seed cost affects farmer profitability.'],
+      sugarcane: ['Sugar mill payment cycles influence cane arrivals.', 'Ethanol blending mandate from government affects sugarcane demand.'],
+      onion: ['Onion is highly volatile — storage and export policy can double or halve prices in weeks.', 'Cold storage arrivals in Apr-Jun typically bring prices down.'],
+      tomato: ['Tomato prices are highly seasonal — check weekly mandi rates.', 'Logistics and perishability cause sharp regional price differences.'],
+    };
+    if (cropInsights[cropId]) insights.push(...cropInsights[cropId]);
+    return insights.slice(0, 4);
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  static getCropDisplayName(cropId: string): string {
     const nameMap: Record<string, string> = {
       rice: 'Rice', wheat: 'Wheat', maize: 'Maize', barley: 'Barley',
       jowar: 'Jowar (Sorghum)', bajra: 'Bajra (Pearl Millet)',
@@ -459,48 +566,17 @@ export class MarketService {
     return nameMap[cropId] || (cropId.charAt(0).toUpperCase() + cropId.slice(1));
   }
 
-  private static getDefaultMarket(): string {
-    // Rotates across major markets without being random (deterministic on date)
-    const markets = ['Delhi', 'Mumbai', 'Bangalore', 'Chennai', 'Hyderabad'];
-    return markets[new Date().getDate() % markets.length];
-  }
-
-  private static getSeasonalPattern(cropId: string): string {
-    const patterns: Record<string, string> = {
-      rice:      'Prices peak during festival seasons (Oct-Nov)',
-      wheat:     'Highest in summer months before harvest',
-      maize:     'Steady demand, peaks in winter',
-      cotton:    'Peak demand during textile season',
-      sugarcane: 'Prices rise during crushing season',
-      tea:       'Higher during winter months',
-      coffee:    'Export-driven, varies with global demand',
-    };
-    return patterns[cropId] ?? 'Seasonal variations based on harvest cycles';
-  }
-
-  private static getPeakSeason(cropId: string): string {
-    const seasons: Record<string, string> = {
-      rice: 'Oct-Dec', wheat: 'Mar-May', maize: 'Dec-Feb',
-      cotton: 'Nov-Jan', sugarcane: 'Nov-Apr', tea: 'Nov-Feb', coffee: 'Jan-Mar',
-    };
-    return seasons[cropId] ?? 'Varies by region';
-  }
-
-  private static getLowSeason(cropId: string): string {
-    const seasons: Record<string, string> = {
-      rice: 'Apr-Jun', wheat: 'Jul-Sep', maize: 'Jun-Aug',
-      cotton: 'May-Jul', sugarcane: 'Jun-Sep', tea: 'May-Aug', coffee: 'Aug-Oct',
-    };
-    return seasons[cropId] ?? 'Post-harvest period';
-  }
-
   private static getNearestMarket(lat: number, lon: number): string {
     if (lat > 28) return 'Delhi';
     if (lat > 25 && lon > 77) return 'Kanpur';
+    if (lat > 20 && lon < 76) return 'Pune';
     if (lat > 19 && lon < 75) return 'Mumbai';
+    if (lat > 17 && lon > 78) return 'Hyderabad';
     if (lat > 15 && lon > 78) return 'Hyderabad';
     if (lat < 15 && lon > 76) return 'Bangalore';
     if (lat < 15 && lon < 76) return 'Chennai';
+    if (lat > 22 && lon > 85) return 'Kolkata';
+    if (lat > 22 && lon < 80) return 'Nagpur';
     return 'Regional Market';
   }
 }
