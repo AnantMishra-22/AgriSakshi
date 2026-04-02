@@ -38,7 +38,6 @@ export interface WeatherAdvisory {
 export class WeatherService {
   // ---- Open-Meteo config (no key required) ----
   private static readonly OM_BASE = 'https://api.open-meteo.com/v1/forecast';
-  // Units & timezone tuned for India usage; adjust as needed
   private static readonly DEFAULT_QUERY = {
     temperature_unit: 'celsius',
     wind_speed_unit: 'kmh',
@@ -48,7 +47,7 @@ export class WeatherService {
 
   // ---------- PUBLIC API ----------
 
-  /** Live current weather from Open-Meteo’s `current` block. */
+  /** Live current weather from Open-Meteo's `current` block. */
   static async getCurrentWeather(lat: number, lon: number): Promise<CurrentWeather> {
     const url = new URL(this.OM_BASE);
     url.searchParams.set('latitude', String(lat));
@@ -83,12 +82,11 @@ export class WeatherService {
     return {
       temperature: this.num(c.temperature_2m),
       humidity: this.num(c.relative_humidity_2m),
-      // precipitation is mm over last hour; include rain+showers if provided
       rainfall: this.num(c.precipitation ?? (this.num(c.rain) + this.num(c.showers))),
       windSpeed: this.num(c.wind_speed_10m),
       windDirection: this.degToCompass(this.num(c.wind_direction_10m)),
       pressure: this.num(c.pressure_msl),
-      visibility: Math.round(this.num(c.visibility) / 1000), // meters → km (rounded)
+      visibility: Math.round(this.num(c.visibility) / 1000),
       uvIndex: this.num(c.uv_index),
       condition: conditionText,
       location: loc,
@@ -145,34 +143,153 @@ export class WeatherService {
   }
 
   /**
-   * Open-Meteo does not provide official advisories.
-   * This generates **derived advisories** from forecast thresholds so your UI keeps working.
-   * Tune thresholds per your crop logic.
+   * Generate weather advisories from real forecast data using lat/lon.
+   * Now fully implemented — no longer returns empty array.
+   * Call this with the user's current lat/lon from locationService.
    */
-  static async getWeatherAdvisories(district: string): Promise<WeatherAdvisory[]> {
-    // You can enhance this by passing lat/lon for district and calling getWeatherForecast()
-    // For now, return an empty array to be safe OR uncomment the “derived” logic below.
-    return [];
-    /*
-    const latLon = await this.lookupDistrictLatLon(district); // implement if needed
-    const fc = await this.getWeatherForecast(latLon.lat, latLon.lon, 5);
+  static async getWeatherAdvisories(
+    district: string,
+    lat?: number,
+    lon?: number
+  ): Promise<WeatherAdvisory[]> {
+    // Default to Hyderabad if no coordinates provided
+    const useLat = lat ?? 17.385;
+    const useLon = lon ?? 78.4867;
+
+    let forecast: WeatherForecast[] = [];
+    try {
+      forecast = await this.getWeatherForecast(useLat, useLon, 5);
+    } catch {
+      return []; // Can't generate advisories without forecast
+    }
 
     const adv: WeatherAdvisory[] = [];
-    fc.forEach((d, idx) => {
-      // simple examples — adjust for your domain
+
+    forecast.forEach((d) => {
+      const nextDay = new Date(d.date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      const validTo = nextDay.toISOString().split('T')[0];
+
+      // Heavy rainfall — disrupts field operations, disease risk
       if (d.rainfall >= 50) {
-        adv.push(this.mkAdv('Heavy Rainfall Advisory', 'high', district, d.date,
-          'Heavy rainfall expected. Postpone spraying and ensure drainage.'));
-      } else if (d.maxTemp >= 40) {
-        adv.push(this.mkAdv('Heat Stress Advisory', 'medium', district, d.date,
-          'High temperature likely. Ensure adequate irrigation and mulch where possible.'));
-      } else if (d.windSpeed >= 50) {
-        adv.push(this.mkAdv('Strong Wind Advisory', 'medium', district, d.date,
-          'Strong winds likely. Secure structures and avoid spraying.'));
+        adv.push(
+          this.mkAdv(
+            'Heavy Rainfall Advisory',
+            'high',
+            district,
+            d.date,
+            validTo,
+            'Heavy rainfall expected. Postpone spraying and fertilizer application. Ensure field drainage is clear to prevent waterlogging. Hold off on harvesting if crops are mature.',
+            'rainfall'
+          )
+        );
+      } else if (d.rainfall >= 20) {
+        adv.push(
+          this.mkAdv(
+            'Moderate Rainfall Advisory',
+            'low',
+            district,
+            d.date,
+            validTo,
+            'Moderate rain expected. Good for standing crops. Avoid pesticide spraying 24 hours before and after rainfall for effectiveness.',
+            'rainfall'
+          )
+        );
+      }
+
+      // Heat stress — crop damage above 40°C
+      if (d.maxTemp >= 42) {
+        adv.push(
+          this.mkAdv(
+            'Extreme Heat Advisory',
+            'extreme',
+            district,
+            d.date,
+            validTo,
+            `Extreme heat (${d.maxTemp}°C) forecast. Water crops in early morning or evening only. Avoid field work between 11AM–3PM. Apply mulch to retain soil moisture. Vegetable crops may need shade nets.`,
+            'temperature'
+          )
+        );
+      } else if (d.maxTemp >= 38) {
+        adv.push(
+          this.mkAdv(
+            'Heat Stress Advisory',
+            'medium',
+            district,
+            d.date,
+            validTo,
+            `High temperature (${d.maxTemp}°C) expected. Ensure adequate irrigation. Consider extra watering for vegetables and fruit crops. Monitor for wilting.`,
+            'temperature'
+          )
+        );
+      }
+
+      // Strong winds — damage to crops, spraying not advisable
+      if (d.windSpeed >= 60) {
+        adv.push(
+          this.mkAdv(
+            'Strong Wind Advisory',
+            'high',
+            district,
+            d.date,
+            validTo,
+            `Strong winds (${d.windSpeed} km/h) expected. Do not spray pesticides or fertilizers. Stake tall crops like maize and sorghum. Secure greenhouse covers and shade nets.`,
+            'wind'
+          )
+        );
+      } else if (d.windSpeed >= 40) {
+        adv.push(
+          this.mkAdv(
+            'Moderate Wind Advisory',
+            'low',
+            district,
+            d.date,
+            validTo,
+            `Moderate winds (${d.windSpeed} km/h) expected. Avoid spraying operations. Check stakes and supports on tall crops.`,
+            'wind'
+          )
+        );
+      }
+
+      // High humidity — fungal disease risk
+      if (d.humidity >= 85 && d.maxTemp >= 28) {
+        adv.push(
+          this.mkAdv(
+            'High Humidity — Disease Risk',
+            'medium',
+            district,
+            d.date,
+            validTo,
+            `High humidity (${d.humidity}%) combined with warm temperatures creates ideal conditions for fungal diseases (blast, blight, mildew). Inspect crops and consider preventive fungicide if disease pressure is high.`,
+            'disease_risk'
+          )
+        );
+      }
+
+      // Cold night risk (winter)
+      if (d.minTemp <= 5) {
+        adv.push(
+          this.mkAdv(
+            'Cold Wave Advisory',
+            'high',
+            district,
+            d.date,
+            validTo,
+            `Very low minimum temperature (${d.minTemp}°C) expected tonight. Cover sensitive nurseries and vegetables. Irrigate lightly in the evening — moist soil retains heat better. Delay transplanting until temperatures rise.`,
+            'temperature'
+          )
+        );
       }
     });
-    return adv;
-    */
+
+    // Deduplicate — keep at most one advisory per category per day
+    const seen = new Set<string>();
+    return adv.filter((a) => {
+      const key = `${a.validFrom}:${a.category}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   // Keep your existing icon map
@@ -189,7 +306,6 @@ export class WeatherService {
     return iconMap[condition] || '🌤️';
   }
 
-  // Optional: keep your seasonal trends mock (unchanged)
   static async getSeasonalTrends(lat: number, lon: number): Promise<any> {
     return {
       monthly: {
@@ -198,91 +314,67 @@ export class WeatherService {
       },
       seasonal: {
         summer: { avgTemp: 35, totalRainfall: 80 },
-        monsoon: { avgTemp: 30, totalRainfall: 400 },
-        winter: { avgTemp: 22, totalRainfall: 35 },
+        monsoon: { avgTemp: 30, totalRainfall: 600 },
+        winter: { avgTemp: 20, totalRainfall: 30 },
       },
     };
   }
 
-  // ---------- Helpers ----------
+  // ── Private helpers ──────────────────────────────────────────────────────────
 
-  private static num(v: any): number {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  private static degToCompass(deg: number): string {
-    const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
-    const ix = Math.round(deg / 22.5) % 16;
-    return dirs[(ix + 16) % 16];
-  }
-
-  private static conditionToIcon(cond: string): string {
-    const c = cond.toLowerCase();
-    if (c.includes('thunder')) return 'stormy';
-    if (c.includes('rain') || c.includes('drizzle')) return 'rainy';
-    if (c.includes('snow')) return 'cloudy';
-    if (c.includes('cloud')) return 'cloudy';
-    if (c.includes('fog') || c.includes('mist') || c.includes('haze')) return 'foggy';
-    if (c.includes('clear') || c.includes('sun')) return 'sunny';
-    return 'clear';
-  }
-
-  /** Map WMO weather codes to readable text. */
-  private static wmoToText(code: number): string {
-    // https://open-meteo.com/en/docs#weathervariables - WMO weather codes
-    const m: Record<number, string> = {
-      0: 'Clear sky',
-      1: 'Mainly clear',
-      2: 'Partly cloudy',
-      3: 'Overcast',
-      45: 'Fog',
-      48: 'Rime fog',
-      51: 'Light drizzle',
-      53: 'Moderate drizzle',
-      55: 'Dense drizzle',
-      56: 'Light freezing drizzle',
-      57: 'Dense freezing drizzle',
-      61: 'Slight rain',
-      63: 'Moderate rain',
-      65: 'Heavy rain',
-      66: 'Light freezing rain',
-      67: 'Heavy freezing rain',
-      71: 'Slight snow',
-      73: 'Moderate snow',
-      75: 'Heavy snow',
-      77: 'Snow grains',
-      80: 'Slight rain showers',
-      81: 'Moderate rain showers',
-      82: 'Violent rain showers',
-      85: 'Slight snow showers',
-      86: 'Heavy snow showers',
-      95: 'Thunderstorm',
-      96: 'Thunderstorm with slight hail',
-      99: 'Thunderstorm with heavy hail',
-    };
-    return m[Number(code)] ?? '—';
-  }
-
-  // If you decide to generate derived advisories, this helper is handy
   private static mkAdv(
     title: string,
-    severity: 'low' | 'medium' | 'high' | 'extreme',
+    severity: WeatherAdvisory['severity'],
     district: string,
-    date: string,
-    message: string
+    validFrom: string,
+    validTo: string,
+    message: string,
+    category: string
   ): WeatherAdvisory {
-    const start = new Date(date + 'T00:00:00');
-    const end = new Date(start.getTime() + 24 * 3600 * 1000);
     return {
-      id: `${title}-${district}-${date}`,
+      id: `${category}-${validFrom}-${Math.random().toString(36).slice(2, 6)}`,
       title,
       message,
       severity,
-      validFrom: start.toISOString(),
-      validTo: end.toISOString(),
+      validFrom,
+      validTo,
       district,
-      category: 'Derived',
+      category,
     };
+  }
+
+  private static num(v: unknown): number {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.round(n * 10) / 10 : 0;
+  }
+
+  private static degToCompass(deg: number): string {
+    const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    return dirs[Math.round(deg / 45) % 8];
+  }
+
+  private static conditionToIcon(condition: string): string {
+    const c = condition.toLowerCase();
+    if (c.includes('storm') || c.includes('thunder')) return 'stormy';
+    if (c.includes('rain') || c.includes('drizzle') || c.includes('shower')) return 'rainy';
+    if (c.includes('fog') || c.includes('mist')) return 'foggy';
+    if (c.includes('cloud')) return c.includes('partly') ? 'partly-cloudy' : 'cloudy';
+    if (c.includes('clear') || c.includes('sunny')) return 'clear';
+    return 'sunny';
+  }
+
+  /** WMO weather code → readable text */
+  private static wmoToText(code: number): string {
+    if (code === 0) return 'Clear sky';
+    if (code <= 2) return 'Partly cloudy';
+    if (code === 3) return 'Overcast';
+    if (code <= 49) return 'Foggy';
+    if (code <= 59) return 'Drizzle';
+    if (code <= 69) return 'Rain';
+    if (code <= 79) return 'Snow';
+    if (code <= 82) return 'Rain showers';
+    if (code <= 84) return 'Snow showers';
+    if (code <= 99) return 'Thunderstorm';
+    return 'Unknown';
   }
 }
