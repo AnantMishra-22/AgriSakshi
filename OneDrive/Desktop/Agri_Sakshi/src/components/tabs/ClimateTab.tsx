@@ -35,7 +35,12 @@ export const ClimateTab = ({ location }: ClimateTabProps) => {
       const [weather, forecastData, advisoryData, trendData] = await Promise.all([
         WeatherService.getCurrentWeather(location.latitude, location.longitude),
         WeatherService.getWeatherForecast(location.latitude, location.longitude, 7),
-        WeatherService.getWeatherAdvisories(location.district || ''),
+        // Now passes lat/lon for real derived advisories from the forecast
+        WeatherService.getWeatherAdvisories(
+          location.district || '',
+          location.latitude,
+          location.longitude
+        ),
         WeatherService.getSeasonalTrends(location.latitude, location.longitude)
       ]);
 
@@ -61,6 +66,16 @@ export const ClimateTab = ({ location }: ClimateTabProps) => {
       case 'medium': return 'warning';
       case 'low': return 'secondary';
       default: return 'secondary';
+    }
+  };
+
+  const getSeverityBorderColor = (severity: string) => {
+    switch (severity) {
+      case 'extreme': return 'border-l-red-600';
+      case 'high': return 'border-l-red-400';
+      case 'medium': return 'border-l-yellow-500';
+      case 'low': return 'border-l-blue-400';
+      default: return 'border-l-gray-400';
     }
   };
 
@@ -175,16 +190,16 @@ export const ClimateTab = ({ location }: ClimateTabProps) => {
       </Card>
 
       {/* Weather Advisories */}
-      {advisories.length > 0 && (
+      {advisories.length > 0 ? (
         <Card className="p-4 shadow-soft">
           <h3 className="font-semibold mb-4 flex items-center">
             <AlertTriangle className="w-5 h-5 mr-2 text-warning" />
-            Weather Advisories
+            Weather Advisories ({advisories.length})
           </h3>
           
           <div className="space-y-3">
             {advisories.map((advisory) => (
-              <Card key={advisory.id} className="p-3 border-l-4 border-l-warning">
+              <Card key={advisory.id} className={`p-3 border-l-4 ${getSeverityBorderColor(advisory.severity)}`}>
                 <div className="flex items-start justify-between mb-2">
                   <h4 className="font-medium">{advisory.title}</h4>
                   <Badge variant={getSeverityColor(advisory.severity) as any}>
@@ -193,13 +208,25 @@ export const ClimateTab = ({ location }: ClimateTabProps) => {
                 </div>
                 <p className="text-sm text-muted-foreground mb-2">{advisory.message}</p>
                 <div className="flex justify-between text-xs text-muted-foreground">
-                  <span>{advisory.category}</span>
-                  <span>Valid until: {formatDate(advisory.validTo)}</span>
+                  <span className="capitalize">{advisory.category.replace(/_/g, ' ')}</span>
+                  <span>Valid: {formatDate(advisory.validFrom)} → {formatDate(advisory.validTo)}</span>
                 </div>
               </Card>
             ))}
           </div>
         </Card>
+      ) : (
+        forecast.length > 0 && (
+          <Card className="p-4 shadow-soft border-green-200 bg-green-50">
+            <div className="flex items-center space-x-2">
+              <span className="text-green-600 text-xl">✅</span>
+              <div>
+                <h4 className="font-medium text-green-700">No Weather Advisories</h4>
+                <p className="text-sm text-green-600">Weather conditions look favourable for the next 5 days.</p>
+              </div>
+            </div>
+          </Card>
+        )
       )}
 
       {/* Seasonal Trends */}
@@ -240,6 +267,7 @@ export const ClimateTab = ({ location }: ClimateTabProps) => {
           <li>• Check wind speed before spraying operations</li>
           <li>• Plan irrigation based on rainfall forecasts</li>
           <li>• Protect crops during extreme weather events</li>
+          <li>• High humidity + warm temperatures = fungal disease risk — inspect crops</li>
         </ul>
       </Card>
     </div>
