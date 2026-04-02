@@ -1,13 +1,9 @@
 // supabase/functions/claude-proxy/index.ts
-// Secure server-side proxy for all Anthropic Claude API calls.
-// The ANTHROPIC_API_KEY is stored in Supabase secrets (never exposed to browser).
-//
+// Proxy for Google Gemini Vision API (replaces Anthropic Claude).
 // Deploy: supabase functions deploy claude-proxy
-// Set secret: supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
+// Set secret: supabase secrets set GEMINI_API_KEY=AIzaSy...
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
-
-const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -16,11 +12,9 @@ const corsHeaders = {
 };
 
 serve(async (req) => {
-  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
-
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ error: 'Method not allowed' }), {
       status: 405,
@@ -31,7 +25,7 @@ serve(async (req) => {
   try {
     const body = await req.json();
 
-    // Validate required fields
+    // Expect: { system: string, messages: [{ role, content: [{type,text},{type,image,...}] }] }
     if (!body.messages || !Array.isArray(body.messages)) {
       return new Response(JSON.stringify({ error: 'messages array required' }), {
         status: 400,
@@ -39,44 +33,80 @@ serve(async (req) => {
       });
     }
 
-    const apiKey = Deno.env.get('ANTHROPIC_API_KEY');
+    const apiKey = Deno.env.get('GEMINI_API_KEY');
     if (!apiKey) {
-      console.error('ANTHROPIC_API_KEY secret not set');
-      return new Response(JSON.stringify({ error: 'Server configuration error' }), {
+      return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not set' }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    const anthropicResponse = await fetch(ANTHROPIC_API_URL, {
+    // Convert Claude-style messages → Gemini parts
+    const parts: object[] = [];
+
+    // Add system prompt as first text part
+    if (body.system) {
+      parts.push({ text: body.system });
+    }
+
+    // Convert each message content block
+    for (const msg of body.messages) {
+      const content = msg.content;
+      if (typeof content === 'string') {
+        parts.push({ text: content });
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'text') {
+            parts.push({ text: block.text });
+          } else if (block.type === 'image' && block.source?.type === 'base64') {
+            parts.push({
+              inlineData: {
+                mimeType: block.source.media_type,
+                data: block.source.data,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    const geminiUrl =
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+    const geminiResponse = await fetch(geminiUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: body.model || 'claude-sonnet-4-20250514',
-        max_tokens: body.max_tokens || 1500,
-        system: body.system,
-        messages: body.messages,
+        contents: [{ parts }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 1500,
+        },
       }),
     });
 
-    if (!anthropicResponse.ok) {
-      const errText = await anthropicResponse.text();
-      console.error('Anthropic API error:', anthropicResponse.status, errText);
+    if (!geminiResponse.ok) {
+      const errText = await geminiResponse.text();
+      console.error('Gemini API error:', geminiResponse.status, errText);
       return new Response(
-        JSON.stringify({ error: `Anthropic API error: ${anthropicResponse.status}` }),
-        {
-          status: anthropicResponse.status,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        }
+        JSON.stringify({ error: `Gemini API error ${geminiResponse.status}`, detail: errText }),
+        { status: geminiResponse.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    const data = await anthropicResponse.json();
-    return new Response(JSON.stringify(data), {
+    const geminiData = await geminiResponse.json();
+
+    // Convert Gemini response → Claude-style response so apiClient.ts needs zero changes
+    const text = geminiData.candidates?.[0]?.content?.parts
+      ?.filter((p: any) => p.text)
+      ?.map((p: any) => p.text)
+      ?.join('') ?? '';
+
+    const claudeStyleResponse = {
+      content: [{ type: 'text', text }],
+    };
+
+    return new Response(JSON.stringify(claudeStyleResponse), {
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
