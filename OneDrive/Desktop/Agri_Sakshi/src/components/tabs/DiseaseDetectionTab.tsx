@@ -1,6 +1,6 @@
 // src/components/tabs/DiseaseDetectionTab.tsx
 // Real plant disease detection powered by Claude Vision API.
-// All mock data removed  actual AI analysis of uploaded images.
+// All mock data removed — actual AI analysis of uploaded images.
 
 import { useState, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';

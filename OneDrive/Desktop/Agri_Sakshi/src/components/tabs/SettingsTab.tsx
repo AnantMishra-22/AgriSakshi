@@ -1,121 +1,223 @@
+// src/components/tabs/SettingsTab.tsx
+// Persists settings to Supabase user_settings table when signed in.
+// Falls back to localStorage when user is anonymous.
+
 import { useState, useEffect } from 'react';
-import { Card } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Input } from "@/components/ui/input";
-import { 
-  Settings, 
-  Globe, 
-  Bell, 
-  MapPin, 
-  Thermometer, 
-  User,
-  Smartphone,
-  Database,
-  HelpCircle
-} from "lucide-react";
-import { useToast } from "@/hooks/use-toast";
-import { useLanguage } from "@/services/languageService";
+import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Input } from '@/components/ui/input';
+import {
+  Settings, Globe, Bell, MapPin, Thermometer,
+  Smartphone, Database, HelpCircle, Loader2, CloudOff, Cloud,
+} from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { useLanguage } from '@/services/languageService';
+import { supabase } from '@/integrations/supabase/client';
+import type { User } from '@supabase/supabase-js';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface AppSettings {
+  language: string;
+  temperature_unit: string;
+  price_unit: string;
+  notifications_on: boolean;
+  dark_mode: boolean;
+  // local-only extras
+  locationSharing: boolean;
+  pincode: string;
+}
+
+const DEFAULTS: AppSettings = {
+  language: 'en',
+  temperature_unit: 'celsius',
+  price_unit: 'quintal',
+  notifications_on: true,
+  dark_mode: false,
+  locationSharing: true,
+  pincode: '',
+};
+
+const LS_KEY = 'agrisakshi_settings';
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export const SettingsTab = () => {
-  const { currentLanguage, changeLanguage, t } = useLanguage();
-  const [language, setLanguage] = useState(currentLanguage);
-  const [temperatureUnit, setTemperatureUnit] = useState('celsius');
-  const [notifications, setNotifications] = useState(true);
-  const [locationSharing, setLocationSharing] = useState(true);
-  const [pincode, setPincode] = useState('');
+  const { changeLanguage, t } = useLanguage();
   const { toast } = useToast();
 
-  // Load saved settings on mount
+  const [user, setUser] = useState<User | null>(null);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULTS);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  // ── Auth listener ────────────────────────────────────────────────────────
+
   useEffect(() => {
-    const savedSettings = localStorage.getItem('agrisakshi_settings');
-    if (savedSettings) {
-      const settings = JSON.parse(savedSettings);
-      setLanguage(settings.language || currentLanguage);
-      setTemperatureUnit(settings.temperatureUnit || 'celsius');
-      setNotifications(settings.notifications !== undefined ? settings.notifications : true);
-      setLocationSharing(settings.locationSharing !== undefined ? settings.locationSharing : true);
-      setPincode(settings.pincode || '');
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+      loadSettings(data.session?.user ?? null);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
+      setUser(session?.user ?? null);
+      loadSettings(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Load: Supabase first, fallback to localStorage ───────────────────────
+
+  const loadSettings = async (currentUser: User | null) => {
+    setLoading(true);
+    try {
+      // Always load local extras first
+      const local = localStorage.getItem(LS_KEY);
+      const localParsed = local ? JSON.parse(local) : {};
+
+      if (currentUser) {
+        const { data, error } = await supabase
+          .from('user_settings')
+          .select('*')
+          .eq('user_id', currentUser.id)
+          .single();
+
+        if (!error && data) {
+          setSettings({
+            language: data.language ?? DEFAULTS.language,
+            temperature_unit: data.temperature_unit ?? DEFAULTS.temperature_unit,
+            price_unit: data.price_unit ?? DEFAULTS.price_unit,
+            notifications_on: data.notifications_on ?? DEFAULTS.notifications_on,
+            dark_mode: data.dark_mode ?? DEFAULTS.dark_mode,
+            locationSharing: localParsed.locationSharing ?? DEFAULTS.locationSharing,
+            pincode: localParsed.pincode ?? DEFAULTS.pincode,
+          });
+          return;
+        }
+      }
+
+      // Fallback: use localStorage entirely
+      setSettings({ ...DEFAULTS, ...localParsed });
+    } catch (err) {
+      console.error('Failed to load settings:', err);
+      setSettings(DEFAULTS);
+    } finally {
+      setLoading(false);
     }
-  }, [currentLanguage]);
-
-  const languages = [
-    { code: 'en', name: 'English', native: 'English' },
-    { code: 'hi', name: 'Hindi', native: 'हिंदी' },
-    { code: 'te', name: 'Telugu', native: 'తెలుగు' },
-    { code: 'ta', name: 'Tamil', native: 'தமிழ்' },
-    { code: 'kn', name: 'Kannada', native: 'ಕನ್ನಡ' },
-    { code: 'ml', name: 'Malayalam', native: 'മലയാളം' },
-    { code: 'gu', name: 'Gujarati', native: 'ગુજરાતી' },
-    { code: 'mr', name: 'Marathi', native: 'मराठी' },
-    { code: 'bn', name: 'Bengali', native: 'বাংলা' },
-    { code: 'pa', name: 'Punjabi', native: 'ਪੰਜਾਬੀ' }
-  ];
-
-  const saveSettings = () => {
-    // Change language in the language service
-    changeLanguage(language as any);
-    
-    // Save settings to localStorage
-    const settings = {
-      language,
-      temperatureUnit,
-      notifications,
-      locationSharing,
-      pincode,
-      updatedAt: new Date().toISOString()
-    };
-    
-    localStorage.setItem('agrisakshi_settings', JSON.stringify(settings));
-    
-    toast({
-      title: t('success'),
-      description: "Your preferences have been updated successfully.",
-    });
   };
 
-  const clearData = () => {
+  // ── Save ──────────────────────────────────────────────────────────────────
+
+  const saveSettings = async () => {
+    setSaving(true);
+    try {
+      // Apply language change immediately
+      changeLanguage(settings.language as any);
+
+      // Always persist local-only extras
+      const local = {
+        language: settings.language,
+        temperature_unit: settings.temperature_unit,
+        locationSharing: settings.locationSharing,
+        pincode: settings.pincode,
+        updatedAt: new Date().toISOString(),
+      };
+      localStorage.setItem(LS_KEY, JSON.stringify(local));
+
+      // Persist rest to Supabase if signed in
+      if (user) {
+        const { error } = await supabase
+          .from('user_settings')
+          .upsert({
+            user_id: user.id,
+            language: settings.language,
+            temperature_unit: settings.temperature_unit,
+            price_unit: settings.price_unit,
+            notifications_on: settings.notifications_on,
+            dark_mode: settings.dark_mode,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_id' });
+
+        if (error) throw error;
+      }
+
+      toast({
+        title: t('success'),
+        description: user ? 'Settings saved to cloud ☁️' : 'Settings saved locally 📱',
+      });
+    } catch (err: any) {
+      toast({ title: 'Save failed', description: err.message, variant: 'destructive' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearData = async () => {
     localStorage.clear();
-    toast({
-      title: "Data Cleared",
-      description: "All app data has been cleared from this device.",
-    });
+    if (user) await supabase.auth.signOut();
+    toast({ title: 'Data cleared', description: 'All app data has been cleared.' });
+    setSettings(DEFAULTS);
   };
+
+  const set = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
+    setSettings(prev => ({ ...prev, [key]: value }));
+
+  // ── Render ────────────────────────────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    );
+  }
 
   return (
     <div className="p-4 space-y-6 pb-20">
+
       {/* Header */}
       <div className="text-center space-y-2">
         <h2 className="text-2xl font-bold flex items-center justify-center">
           <Settings className="w-6 h-6 mr-2 text-primary" />
           {t('settings')}
         </h2>
-        <p className="text-muted-foreground">Customize your AgriSakshi experience</p>
+        <div className="flex items-center justify-center gap-1 text-sm text-muted-foreground">
+          {user
+            ? <><Cloud className="w-3 h-3 text-green-500" /> Syncing to cloud</>
+            : <><CloudOff className="w-3 h-3" /> Local only — sign in to sync</>}
+        </div>
       </div>
 
-      {/* Language & Localization */}
+      {/* Language & Region */}
       <Card className="p-4 shadow-soft">
         <h3 className="font-semibold mb-4 flex items-center">
           <Globe className="w-5 h-5 mr-2 text-info" />
           Language & Region
         </h3>
-        
         <div className="space-y-4">
           <div>
-            <Label htmlFor="language">{t('language')}</Label>
-            <Select value={language} onValueChange={(value) => setLanguage(value as any)}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
+            <Label>{t('language')}</Label>
+            <Select value={settings.language} onValueChange={v => set('language', v)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                {languages.map((lang) => (
+                {[
+                  { code: 'en', name: 'English', native: 'English' },
+                  { code: 'hi', name: 'Hindi', native: 'हिंदी' },
+                  { code: 'te', name: 'Telugu', native: 'తెలుగు' },
+                  { code: 'ta', name: 'Tamil', native: 'தமிழ்' },
+                  { code: 'kn', name: 'Kannada', native: 'ಕನ್ನಡ' },
+                  { code: 'ml', name: 'Malayalam', native: 'മലയാളം' },
+                  { code: 'gu', name: 'Gujarati', native: 'ગુજरাती' },
+                  { code: 'mr', name: 'Marathi', native: 'मराठी' },
+                  { code: 'bn', name: 'Bengali', native: 'বাংলা' },
+                  { code: 'pa', name: 'Punjabi', native: 'ਪੰਜਾਬੀ' },
+                ].map(lang => (
                   <SelectItem key={lang.code} value={lang.code}>
-                    <div className="flex items-center space-x-2">
-                      <span>{lang.name}</span>
-                      <span className="text-muted-foreground">({lang.native})</span>
-                    </div>
+                    {lang.name} ({lang.native})
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -123,55 +225,57 @@ export const SettingsTab = () => {
           </div>
 
           <div>
-            <Label htmlFor="temperature">Temperature Unit</Label>
-            <Select value={temperatureUnit} onValueChange={setTemperatureUnit}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
+            <Label>Temperature Unit</Label>
+            <Select value={settings.temperature_unit} onValueChange={v => set('temperature_unit', v)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="celsius">Celsius (°C)</SelectItem>
                 <SelectItem value="fahrenheit">Fahrenheit (°F)</SelectItem>
               </SelectContent>
             </Select>
           </div>
+
+          <div>
+            <Label>Price Unit</Label>
+            <Select value={settings.price_unit} onValueChange={v => set('price_unit', v)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="quintal">Per Quintal (₹/q)</SelectItem>
+                <SelectItem value="kg">Per Kg (₹/kg)</SelectItem>
+                <SelectItem value="tonne">Per Tonne (₹/t)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       </Card>
 
-      {/* Location Settings */}
+      {/* Location */}
       <Card className="p-4 shadow-soft">
         <h3 className="font-semibold mb-4 flex items-center">
           <MapPin className="w-5 h-5 mr-2 text-warning" />
           Location Settings
         </h3>
-        
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div>
-              <Label htmlFor="location-sharing">Auto-detect Location</Label>
-              <p className="text-sm text-muted-foreground">
-                Allow app to use GPS for weather and soil data
-              </p>
+              <Label>Auto-detect Location</Label>
+              <p className="text-sm text-muted-foreground">Use GPS for weather and soil data</p>
             </div>
             <Switch
-              id="location-sharing"
-              checked={locationSharing}
-              onCheckedChange={setLocationSharing}
+              checked={settings.locationSharing}
+              onCheckedChange={v => set('locationSharing', v)}
             />
           </div>
-
           <div>
-            <Label htmlFor="pincode">Backup PIN Code</Label>
+            <Label>Backup PIN Code</Label>
             <Input
-              id="pincode"
               type="text"
               placeholder="Enter your area PIN code"
-              value={pincode}
-              onChange={(e) => setPincode(e.target.value)}
+              value={settings.pincode}
+              onChange={e => set('pincode', e.target.value)}
               maxLength={6}
             />
-            <p className="text-xs text-muted-foreground mt-1">
-              Used when GPS is unavailable
-            </p>
+            <p className="text-xs text-muted-foreground mt-1">Used when GPS is unavailable</p>
           </div>
         </div>
       </Card>
@@ -182,47 +286,15 @@ export const SettingsTab = () => {
           <Bell className="w-5 h-5 mr-2 text-accent" />
           Notifications
         </h3>
-        
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div>
-              <Label htmlFor="notifications">Weather Alerts</Label>
-              <p className="text-sm text-muted-foreground">
-                Get notified about weather warnings and advisories
-              </p>
+              <Label>Weather Alerts</Label>
+              <p className="text-sm text-muted-foreground">Warnings and advisories</p>
             </div>
             <Switch
-              id="notifications"
-              checked={notifications}
-              onCheckedChange={setNotifications}
-            />
-          </div>
-
-          <div className="flex items-center justify-between">
-            <div>
-              <Label htmlFor="crop-reminders">Crop Reminders</Label>
-              <p className="text-sm text-muted-foreground">
-                Sowing and harvest time reminders
-              </p>
-            </div>
-            <Switch
-              id="crop-reminders"
-              checked={true}
-              onCheckedChange={() => {}}
-            />
-          </div>
-
-          <div className="flex items-center justify-between">
-            <div>
-              <Label htmlFor="market-updates">Market Updates</Label>
-              <p className="text-sm text-muted-foreground">
-                Price trends and market information
-              </p>
-            </div>
-            <Switch
-              id="market-updates"
-              checked={false}
-              onCheckedChange={() => {}}
+              checked={settings.notifications_on}
+              onCheckedChange={v => set('notifications_on', v)}
             />
           </div>
         </div>
@@ -234,82 +306,48 @@ export const SettingsTab = () => {
           <Database className="w-5 h-5 mr-2 text-destructive" />
           Data & Privacy
         </h3>
-        
         <div className="space-y-4">
           <div className="p-3 bg-muted/30 rounded-lg">
             <p className="text-sm">
-              Your data is stored locally on your device. We don't collect personal information 
-              without your consent.
+              {user
+                ? 'Your settings are encrypted and stored in Supabase. They sync across all your devices.'
+                : 'Settings are stored locally. Sign in to sync across devices.'}
             </p>
           </div>
-
-          <Button variant="outline" onClick={clearData} className="w-full">
-            Clear All Data
+          <Button variant="outline" onClick={clearData} className="w-full text-destructive">
+            Clear All Data & Sign Out
           </Button>
         </div>
       </Card>
 
-      {/* App Information */}
+      {/* App Info */}
       <Card className="p-4 shadow-soft">
         <h3 className="font-semibold mb-4 flex items-center">
           <Smartphone className="w-5 h-5 mr-2 text-info" />
           App Information
         </h3>
-        
-        <div className="space-y-3">
-          <div className="flex justify-between text-sm">
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between">
             <span className="text-muted-foreground">Version:</span>
             <span>1.0.0</span>
           </div>
-          <div className="flex justify-between text-sm">
-            <span className="text-muted-foreground">Build:</span>
-            <span>2024.12.19</span>
-          </div>
-          <div className="flex justify-between text-sm">
-            <span className="text-muted-foreground">Last Updated:</span>
-            <span>Today</span>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Session:</span>
+            <span>{user ? '🔐 Signed in' : '👤 Anonymous'}</span>
           </div>
         </div>
       </Card>
 
-      {/* Help & Support */}
-      <Card className="p-4 shadow-soft">
-        <h3 className="font-semibold mb-4 flex items-center">
-          <HelpCircle className="w-5 h-5 mr-2 text-accent" />
-          Help & Support
-        </h3>
-        
-        <div className="space-y-3">
-          <Button variant="outline" className="w-full justify-start">
-            User Guide & Tutorials
-          </Button>
-          <Button variant="outline" className="w-full justify-start">
-            Frequently Asked Questions
-          </Button>
-          <Button variant="outline" className="w-full justify-start">
-            Contact Support
-          </Button>
-          <Button variant="outline" className="w-full justify-start">
-            Send Feedback
-          </Button>
-        </div>
-      </Card>
+      {/* Save */}
+      <Button onClick={saveSettings} className="w-full" disabled={saving}>
+        {saving
+          ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+          : null}
+        {t('save')} {t('settings')}
+      </Button>
 
-      {/* Save Settings */}
-      <div className="flex gap-3">
-        <Button onClick={saveSettings} className="flex-1">
-          {t('save')} {t('settings')}
-        </Button>
-      </div>
-
-      {/* Footer */}
-      <div className="text-center pt-4">
-        <p className="text-xs text-muted-foreground">
-          AgriSakshi - Your AI-powered farming companion
-        </p>
-        <p className="text-xs text-muted-foreground">
-          Made with ❤️ for farmers
-        </p>
+      <div className="text-center pt-2">
+        <p className="text-xs text-muted-foreground">AgriSakshi — Made with ❤️ for farmers</p>
       </div>
     </div>
   );
