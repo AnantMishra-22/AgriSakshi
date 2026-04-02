@@ -1,7 +1,7 @@
 // supabase/functions/claude-proxy/index.ts
-// Proxy for Google Gemini Vision API (replaces Anthropic Claude).
-// Deploy: supabase functions deploy claude-proxy
-// Set secret: supabase secrets set GEMINI_API_KEY=AIzaSy...
+// Proxy for OpenRouter API (vision-capable, free tier available).
+// Deploy:    supabase functions deploy claude-proxy
+// Set secret: supabase secrets set OPENROUTER_API_KEY=sk-or-...
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 
@@ -15,6 +15,7 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
+
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ error: 'Method not allowed' }), {
       status: 405,
@@ -25,7 +26,6 @@ serve(async (req) => {
   try {
     const body = await req.json();
 
-    // Expect: { system: string, messages: [{ role, content: [{type,text},{type,image,...}] }] }
     if (!body.messages || !Array.isArray(body.messages)) {
       return new Response(JSON.stringify({ error: 'messages array required' }), {
         status: 400,
@@ -33,36 +33,37 @@ serve(async (req) => {
       });
     }
 
-    const apiKey = Deno.env.get('GEMINI_API_KEY');
+    const apiKey = Deno.env.get('OPENROUTER_API_KEY');
     if (!apiKey) {
-      return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not set' }), {
+      return new Response(JSON.stringify({ error: 'OPENROUTER_API_KEY not set' }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Convert Claude-style messages → Gemini parts
-    const parts: object[] = [];
+    // Build a single content array for OpenRouter from Claude-style messages.
+    // System prompt goes in as the first text block, then each message block follows.
+    const contentParts: object[] = [];
 
-    // Add system prompt as first text part
     if (body.system) {
-      parts.push({ text: body.system });
+      contentParts.push({ type: 'text', text: body.system });
     }
 
-    // Convert each message content block
     for (const msg of body.messages) {
       const content = msg.content;
+
       if (typeof content === 'string') {
-        parts.push({ text: content });
+        contentParts.push({ type: 'text', text: content });
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (block.type === 'text') {
-            parts.push({ text: block.text });
+            contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image' && block.source?.type === 'base64') {
-            parts.push({
-              inlineData: {
-                mimeType: block.source.media_type,
-                data: block.source.data,
+            // OpenRouter expects a data-URL inside image_url
+            contentParts.push({
+              type: 'image_url',
+              image_url: {
+                url: `data:${block.source.media_type};base64,${block.source.data}`,
               },
             });
           }
@@ -70,46 +71,50 @@ serve(async (req) => {
       }
     }
 
-    const geminiUrl =
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-    const geminiResponse = await fetch(geminiUrl, {
+    const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://agrisakshi.app', // helps OpenRouter track your app
+        'X-Title': 'AgriSakshi',
+      },
       body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 1500,
-        },
+        model: 'google/gemini-2.0-flash-exp:free', // free, vision-capable
+        messages: [
+          {
+            role: 'user',
+            content: contentParts,
+          },
+        ],
+        max_tokens: body.max_tokens ?? 1500,
+        temperature: 0.2,
       }),
     });
 
-    if (!geminiResponse.ok) {
-      const errText = await geminiResponse.text();
-      console.error('Gemini API error:', geminiResponse.status, errText);
+    if (!openRouterResponse.ok) {
+      const errText = await openRouterResponse.text();
+      console.error('OpenRouter error:', openRouterResponse.status, errText);
       return new Response(
-        JSON.stringify({ error: `Gemini API error ${geminiResponse.status}`, detail: errText }),
-        { status: geminiResponse.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify({ error: `OpenRouter API error ${openRouterResponse.status}`, detail: errText }),
+        {
+          status: openRouterResponse.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
       );
     }
 
-    const geminiData = await geminiResponse.json();
+    const data = await openRouterResponse.json();
+    const text = data.choices?.[0]?.message?.content ?? '';
 
-    // Convert Gemini response → Claude-style response so apiClient.ts needs zero changes
-    const text = geminiData.candidates?.[0]?.content?.parts
-      ?.filter((p: any) => p.text)
-      ?.map((p: any) => p.text)
-      ?.join('') ?? '';
-
-    const claudeStyleResponse = {
-      content: [{ type: 'text', text }],
-    };
-
-    return new Response(JSON.stringify(claudeStyleResponse), {
-      status: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    // Return in Claude-style format so apiClient.ts needs zero changes
+    return new Response(
+      JSON.stringify({ content: [{ type: 'text', text }] }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
   } catch (err) {
     console.error('Proxy error:', err);
     return new Response(JSON.stringify({ error: 'Internal server error' }), {
