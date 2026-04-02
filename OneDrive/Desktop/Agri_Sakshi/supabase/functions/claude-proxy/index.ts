@@ -80,7 +80,7 @@ serve(async (req) => {
         'X-Title': 'AgriSakshi',
       },
       body: JSON.stringify({
-        model: 'google/gemini-2.0-flash:free', // free, vision-capable
+        model: 'openrouter/auto', // free, vision-capable
         messages: [
           {
             role: 'user',
